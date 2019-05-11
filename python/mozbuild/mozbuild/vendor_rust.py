@@ -164,6 +164,7 @@ Please commit or stash these changes before vendoring, or re-run with `--ignore-
             'adler32',
             'bindgen',
             'fuchsia-zircon',
+            'fuchsia-cprng',
             'fuchsia-zircon-sys',
         ]
     }
