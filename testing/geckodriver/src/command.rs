@@ -1,9 +1,9 @@
 use base64;
 use crate::logging;
 use hyper::Method;
-use regex::Captures;
 use serde::de::{self, Deserialize, Deserializer};
 use serde_json::{self, Value};
+use std::collections::HashMap;
 use std::env;
 use std::fs::File;
 use std::io::prelude::*;
@@ -71,7 +71,7 @@ impl WebDriverExtensionRoute for GeckoExtensionRoute {
 
     fn command(
         &self,
-        params: &Captures,
+        params: &HashMap<String, String>,
         body_data: &Value,
     ) -> WebDriverResult<WebDriverCommand<GeckoExtensionCommand>> {
         use self::GeckoExtensionRoute::*;
@@ -83,7 +83,7 @@ impl WebDriverExtensionRoute for GeckoExtensionRoute {
             }
             XblAnonymousChildren => {
                 let element_id = try_opt!(
-                    params.name("elementId"),
+                    params.get("elementId"),
                     ErrorStatus::InvalidArgument,
                     "Missing elementId parameter"
                 );
@@ -92,7 +92,7 @@ impl WebDriverExtensionRoute for GeckoExtensionRoute {
             }
             XblAnonymousByAttribute => {
                 let element_id = try_opt!(
-                    params.name("elementId"),
+                    params.get("elementId"),
                     ErrorStatus::InvalidArgument,
                     "Missing elementId parameter"
                 );

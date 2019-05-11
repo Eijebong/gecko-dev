@@ -1,23 +1,21 @@
 use serde_json;
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use futures::{future, Future, Stream};
-use http;
-use hyper::server::conn::Http;
-use hyper::service::Service;
-use hyper::{self, Body, Method, Request, Response, StatusCode};
+use http::{self, Method, StatusCode};
 use tokio::net::TcpListener;
 use tokio::reactor::Handle;
-use tokio::runtime::current_thread::Runtime;
+use warp::{self, Buf, Filter, Rejection};
 
 use crate::command::{WebDriverCommand, WebDriverMessage};
 use crate::error::{ErrorStatus, WebDriverError, WebDriverResult};
-use crate::httpapi::{VoidWebDriverExtensionRoute, WebDriverExtensionRoute, WebDriverHttpApi};
+use crate::httpapi::{VoidWebDriverExtensionRoute, WebDriverExtensionRoute};
 use crate::response::{CloseWindowResponse, WebDriverResponse};
+use crate::httpapi::{standard_routes, Route};
 
 // Silence warning about Quit being unused for now.
 #[allow(dead_code)]
@@ -153,49 +151,113 @@ impl<T: WebDriverHandler<U>, U: WebDriverExtensionRoute> Dispatcher<T, U> {
     }
 }
 
-#[derive(Debug, Clone)]
-struct HttpHandler<U: WebDriverExtensionRoute> {
-    chan: Arc<Mutex<Sender<DispatchMessage<U>>>>,
-    api: Arc<Mutex<WebDriverHttpApi<U>>>,
+pub struct Listener {
+    _guard: Option<thread::JoinHandle<()>>,
+    pub socket: SocketAddr,
 }
 
-impl<U: WebDriverExtensionRoute> HttpHandler<U> {
-    fn new(
-        api: Arc<Mutex<WebDriverHttpApi<U>>>,
-        chan: Sender<DispatchMessage<U>>,
-    ) -> HttpHandler<U> {
-        HttpHandler {
-            chan: Arc::new(Mutex::new(chan)),
-            api,
-        }
+impl Drop for Listener {
+    fn drop(&mut self) {
+        let _ = self._guard.take().map(|j| j.join());
     }
 }
 
-impl<U: WebDriverExtensionRoute + 'static> Service for HttpHandler<U> {
-    type ReqBody = Body;
-    type ResBody = Body;
+pub fn start<T, U>(
+    address: SocketAddr,
+    handler: T,
+    extension_routes: Vec<(Method, &'static str, U)>,
+) -> ::std::io::Result<Listener>
+where
+    T: 'static + WebDriverHandler<U>,
+    U: 'static + WebDriverExtensionRoute + Send + Sync,
+{
+    let listener = StdTcpListener::bind(address)?;
+    let addr = listener.local_addr()?;
+    let (msg_send, msg_recv) = channel();
 
-    type Error = hyper::Error;
-    type Future = Box<future::Future<Item = Response<Self::ResBody>, Error = hyper::Error> + Send>;
+    //let api = Arc::new(Mutex::new(WebDriverHttpApi::new(extension_routes)));
 
-    fn call(&mut self, req: Request<Self::ReqBody>) -> Self::Future {
-        let uri = req.uri().clone();
-        let method = req.method().clone();
-        let api = self.api.clone();
-        let chan = self.chan.clone();
+    let builder = thread::Builder::new().name("webdriver server".to_string());
+    let handle = builder.spawn(move || {
+        let listener = TcpListener::from_std(listener, &Handle::default()).unwrap();
+        let wroutes = build_warp_routes(&extension_routes, msg_send.clone());
+        warp::serve(wroutes).run_incoming(listener.incoming());
+    })?;
 
-        Box::new(req.into_body().concat2().and_then(move |body| {
-            let body = String::from_utf8(body.to_vec()).unwrap();
-            debug!("-> {} {} {}", method, uri, body);
+    let builder = thread::Builder::new().name("webdriver dispatcher".to_string());
+    builder.spawn(move || {
+        let mut dispatcher = Dispatcher::new(handler);
+        dispatcher.run(&msg_recv);
+    })?;
 
-            let msg_result = {
-                // The fact that this locks for basically the whole request doesn't
-                // matter as long as we are only handling one request at a time.
-                match api.lock() {
-                    Ok(ref api) => api.decode_request(&method, &uri.path(), &body[..]),
-                    Err(e) => panic!("Error decoding request: {:?}", e),
-                }
-            };
+    Ok(Listener { _guard: Some(handle), socket: addr })
+}
+
+fn build_warp_routes<U: 'static + WebDriverExtensionRoute + Send + Sync>(ext_routes: &[(Method, &'static str, U)], chan: Sender<DispatchMessage<U>>)
+    -> impl Filter<Extract=impl warp::Reply, Error=Rejection>
+{
+    let chan = Arc::new(Mutex::new(chan));
+    let mut std_routes = standard_routes::<U>();
+    let (method, path, res) = std_routes.pop().unwrap();
+    let mut wroutes = build_route(method, path, res, chan.clone());
+    for (method, path, res) in std_routes {
+        wroutes = wroutes.or(build_route(method, path, res.clone(), chan.clone())).unify().boxed()
+    }
+    for (method, path, res) in ext_routes {
+        wroutes = wroutes.or(build_route(method.clone(), path, Route::Extension(res.clone()), chan.clone())).unify().boxed()
+    }
+    wroutes
+}
+
+fn build_route<U: 'static + WebDriverExtensionRoute + Send + Sync>(method: Method, path: &'static str, route: Route<U>, chan: Arc<Mutex<Sender<DispatchMessage<U>>>>) -> warp::filters::BoxedFilter<(impl warp::Reply,)> {
+    // Create an empty filter based on the provided method and append an empty hashmap to it. The
+    // hashmap will be used to store path parameters.
+    let mut subroute = match method {
+        Method::GET => { warp::get2().boxed() }
+        Method::POST => { warp::post2().boxed() }
+        Method::DELETE => { warp::delete2().boxed() }
+        Method::OPTIONS => { warp::options().boxed() }
+        Method::PUT => { warp::put2().boxed() }
+        _ => panic!("Unsupported method")
+    }.map(|| HashMap::new()).boxed();
+
+    // For each part of the path, if it's a normal part, just append it to the current filter,
+    // otherwise if it's a parameter (a named enclosed in { }), we take that parameter and insert
+    // it into the hashmap created earlier.
+    for part in path.split('/') {
+        if part.is_empty() {
+            continue
+        } else if part.starts_with('{') {
+            assert!(part.ends_with('}'));
+
+            subroute = subroute
+                .and(warp::path::param())
+                .map(move |mut params: HashMap<String, String>, param: String| {
+                    let name = &part[1..part.len()-1];
+                    params.insert(name.to_string(), param);
+                    params
+                }).boxed();
+        } else {
+            subroute = subroute.and(warp::path(part)).boxed();
+        }
+    }
+
+    // Finally, tell warp that the path is complete
+    subroute
+        .and(warp::path::end())
+        .and(warp::body::concat())
+        .map(move |params, body: warp::body::FullBody| {
+            let body = String::from_utf8(body.collect::<Vec<u8>>());
+            if body.is_err() {
+                return warp::reply::with_status("The body wasn't valid UTF-8".to_string(), StatusCode::BAD_REQUEST)
+            }
+
+            let msg_result = WebDriverMessage::from_http(
+                route.clone(),
+                &params,
+                &body.unwrap(),
+                method == Method::POST,
+            );
 
             let (status, resp_body) = match msg_result {
                 Ok(message) => {
@@ -224,70 +286,9 @@ impl<U: WebDriverExtensionRoute + 'static> Service for HttpHandler<U> {
                 Err(e) => (e.http_status(), serde_json::to_string(&e).unwrap()),
             };
 
-            debug!("<- {} {}", status, resp_body);
-
-            let response = Response::builder()
-                .status(status)
-                .header(http::header::CONTENT_TYPE, "application/json; charset=utf-8")
-                .header(http::header::CACHE_CONTROL, "no-cache")
-                .body(resp_body.into())
-                .unwrap();
-
-            Ok(response)
-        }))
-    }
-}
-
-pub struct Listener {
-    _guard: Option<thread::JoinHandle<()>>,
-    pub socket: SocketAddr,
-}
-
-impl Drop for Listener {
-    fn drop(&mut self) {
-        let _ = self._guard.take().map(|j| j.join());
-    }
-}
-
-pub fn start<T, U>(
-    address: SocketAddr,
-    handler: T,
-    extension_routes: &[(Method, &str, U)],
-) -> ::std::io::Result<Listener>
-where
-    T: 'static + WebDriverHandler<U>,
-    U: 'static + WebDriverExtensionRoute,
-{
-    let listener = StdTcpListener::bind(address)?;
-    let addr = listener.local_addr()?;
-    let (msg_send, msg_recv) = channel();
-
-    let api = Arc::new(Mutex::new(WebDriverHttpApi::new(extension_routes)));
-
-    let builder = thread::Builder::new().name("webdriver server".to_string());
-    let handle = builder.spawn(move || {
-        let mut rt = Runtime::new().unwrap();
-        let listener = TcpListener::from_std(listener, &Handle::default()).unwrap();
-
-        let http_handler = HttpHandler::new(api, msg_send.clone());
-        let http = Http::new();
-        let handle = rt.handle();
-
-        let fut = listener.incoming()
-            .for_each(move |socket| {
-                let fut = http.serve_connection(socket, http_handler.clone()).map_err(|_| ());
-                handle.spawn(fut).unwrap();
-                Ok(())
-            });
-
-        rt.block_on(fut).unwrap();
-    })?;
-
-    let builder = thread::Builder::new().name("webdriver dispatcher".to_string());
-    builder.spawn(move || {
-        let mut dispatcher = Dispatcher::new(handler);
-        dispatcher.run(&msg_recv);
-    })?;
-
-    Ok(Listener { _guard: Some(handle), socket: addr })
+            warp::reply::with_status(resp_body, status)
+        })
+        .with(warp::reply::with::header(http::header::CONTENT_TYPE, "application/json; charset=utf-8"))
+        .with(warp::reply::with::header(http::header::CACHE_CONTROL, "no-cache"))
+        .boxed()
 }
